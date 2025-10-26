@@ -16,6 +16,8 @@ import os
 import csv
 import re
 import ctypes
+from config_manager import ConfigManager
+from remote_ocr import RemoteOCR
 
 if hasattr(sys, '_MEIPASS'):
     base_path = sys._MEIPASS
@@ -85,6 +87,14 @@ class MixTeXApp:
         settings_menu.add_checkbutton(label="$ 公式 $", onvalue=1, offvalue=0, command=self.toggle_latex_replacement, variable=tk.BooleanVar(value=self.use_dollars_for_inline_math))
         settings_menu.add_checkbutton(label="$$ 单行公式 $$", onvalue=1, offvalue=0, command=self.toggle_convert_align_to_equations, variable=tk.BooleanVar(value=self.convert_align_to_equations_enabled))
         self.menu.add_cascade(label="设置", menu=settings_menu)
+        
+        # 模型选择菜单
+        model_menu = tk.Menu(self.menu, tearoff=0)
+        model_menu.add_command(label="使用本地模型", command=self.switch_to_local)
+        model_menu.add_command(label="使用远程模型", command=self.switch_to_remote)
+        model_menu.add_command(label="配置远程API", command=self.configure_remote_api)
+        self.menu.add_cascade(label="模型", menu=model_menu)
+        
         self.menu.add_command(label="反馈标注", command=self.show_feedback_options)
         self.menu.add_command(label="最小化", command=self.minimize)
         self.menu.add_command(label="关于", command=self.show_about)
@@ -98,13 +108,19 @@ class MixTeXApp:
 
         self.create_tray_icon()
 
+        # 初始化配置管理器
+        self.config_manager = ConfigManager()
+        self.remote_ocr = None
+        
+        # 尝试加载本地模型，如果失败也没关系
         self.model = self.load_model('onnx')
         if self.model is None:
-            self.log("模型加载失败，部分功能将不可用")
-            self.ocr_paused = True  # 暂停OCR功能
-        else:
-            self.ocr_thread = threading.Thread(target=self.ocr_loop, daemon=True)
-            self.ocr_thread.start()
+            self.log("本地模型未找到")
+            self.log("可以配置远程API使用远程模型")
+        
+        # 启动OCR线程（会根据配置自动选择模型）
+        self.ocr_thread = threading.Thread(target=self.ocr_loop, daemon=True)
+        self.ocr_thread.start()
 
         self.donate_window = None
 
@@ -184,6 +200,63 @@ class MixTeXApp:
 
     def toggle_convert_align_to_equations(self):
         self.convert_align_to_equations_enabled = not self.convert_align_to_equations_enabled
+    
+    def switch_to_local(self):
+        """切换到本地模型"""
+        self.config_manager.set_model_type("local")
+        self.log("已切换到本地模型")
+    
+    def switch_to_remote(self):
+        """切换到远程模型"""
+        remote_config = self.config_manager.get_remote_config()
+        if not remote_config.get("api_key"):
+            self.log("请先配置远程API")
+            return
+        
+        self.config_manager.set_model_type("remote")
+        # 初始化远程OCR，传入log回调
+        self.remote_ocr = RemoteOCR(
+            remote_config["base_url"],
+            remote_config["api_key"],
+            remote_config["model_name"],
+            log_callback=self.log
+        )
+        self.log("已切换到远程模型")
+    
+    def configure_remote_api(self):
+        """配置远程API"""
+        config_window = tk.Toplevel(self.root)
+        config_window.title("配置远程API")
+        config_window.geometry("400x200")
+        config_window.wm_attributes('-topmost', 1)
+        
+        remote_config = self.config_manager.get_remote_config()
+        
+        tk.Label(config_window, text="API Base URL:").pack(pady=5)
+        url_entry = tk.Entry(config_window, width=50)
+        url_entry.insert(0, remote_config.get("base_url", ""))
+        url_entry.pack(pady=5)
+        
+        tk.Label(config_window, text="API Key:").pack(pady=5)
+        key_entry = tk.Entry(config_window, width=50, show="*")
+        key_entry.insert(0, remote_config.get("api_key", ""))
+        key_entry.pack(pady=5)
+        
+        tk.Label(config_window, text="Model Name:").pack(pady=5)
+        model_entry = tk.Entry(config_window, width=50)
+        model_entry.insert(0, remote_config.get("model_name", ""))
+        model_entry.pack(pady=5)
+        
+        def save_config():
+            self.config_manager.set_remote_config(
+                url_entry.get(),
+                key_entry.get(),
+                model_entry.get()
+            )
+            self.log("远程API配置已保存")
+            config_window.destroy()
+        
+        tk.Button(config_window, text="保存", command=save_config).pack(pady=10)
 
     def minimize(self):
         self.root.withdraw()
@@ -270,12 +343,7 @@ class MixTeXApp:
                         break
             
             if valid_path is None:
-                self.log("找不到有效的模型文件")
-                # 显示错误对话框
-                import ctypes
-                ctypes.windll.user32.MessageBoxW(0, 
-                    "找不到必要的模型文件\n请确保exe同目录下的onnx文件夹包含完整的模型文件。", 
-                    "模型加载错误", 0)
+                # 在程序窗口提示用户
                 return None
                     
             tokenizer = RobertaTokenizer.from_pretrained(valid_path)
@@ -285,11 +353,7 @@ class MixTeXApp:
             self.log('\n===成功加载模型===\n')
             return (tokenizer, feature_extractor, encoder_session, decoder_session)
         except Exception as e:
-            self.log(f"模型加载失败: {e}")
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(0, 
-                f"模型加载失败: {str(e)}\n请确保exe同目录下的onnx文件夹包含完整的模型文件。", 
-                "模型加载错误", 0)
+            # 在程序窗口提示用户
             return None
 
     def show_feedback_options(self):
@@ -444,13 +508,51 @@ class MixTeXApp:
                 try:
                     image = ImageGrab.grabclipboard()
                     if image is not None and type(image) != list:
-                        self.current_image = self.pad_image(image.convert("RGB"), (448,448))
-                        result = self.mixtex_inference(512, 3, 768, 12, 1)
-                        result = result.replace('\\[', '\\begin{align*}').replace('\\]', '\\end{align*}').replace('%', '\\%')
-                        self.output = result
-                        if self.use_dollars_for_inline_math:
-                            result = result.replace('\\(', '$').replace('\\)', '$')
-                        pyperclip.copy(result)
+                        # 检查使用哪种模型
+                        model_type = self.config_manager.get_model_type()
+                        
+                        if model_type == "remote":
+                            # 使用远程模型
+                            if self.remote_ocr is None:
+                                remote_config = self.config_manager.get_remote_config()
+                                if not remote_config.get("api_key"):
+                                    self.log("请先配置远程API")
+                                    time.sleep(1)
+                                    continue
+                                # 初始化远程OCR，传入log回调
+                                self.remote_ocr = RemoteOCR(
+                                    remote_config["base_url"],
+                                    remote_config["api_key"],
+                                    remote_config["model_name"],
+                                    log_callback=self.log
+                                )
+                            self.current_image = image.convert("RGB")
+                            # 传递格式设置给远程OCR
+                            result = self.remote_ocr.recognize(
+                                self.current_image,
+                                use_inline_dollars=self.use_dollars_for_inline_math,
+                                use_display_mode=self.convert_align_to_equations_enabled
+                            )
+                            # 显示识别结果
+                            if result:
+                                self.log("\n=== 识别结果 ===")
+                                self.log(result)
+                                self.log("\n=== 已复制到剪贴板 ===")
+                        else:
+                            # 使用本地模型
+                            if self.model is None:
+                                self.log("本地模型未加载，请配置远程模型")
+                                time.sleep(1)
+                                continue
+                            self.current_image = self.pad_image(image.convert("RGB"), (448,448))
+                            result = self.mixtex_inference(512, 3, 768, 12, 1)
+                        
+                        if result:
+                            result = result.replace('\\[', '\\begin{align*}').replace('\\]', '\\end{align*}').replace('%', '\\%')
+                            self.output = result
+                            if self.use_dollars_for_inline_math:
+                                result = result.replace('\\(', '$').replace('\\)', '$')
+                            pyperclip.copy(result)
                 except Exception as e:
                     self.log(f"Error: {e}")
                 time.sleep(0.1)
